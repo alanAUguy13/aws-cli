@@ -1,0 +1,28 @@
+[package]
+name = "rustgate"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Deterministic governance core: observations -> facts -> policies -> decisions -> signed evidence, with deterministic replay."
+license = "Apache-2.0"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "rustgate-demo"
+path = "src/bin/demo.rs"
+
+[dependencies]
+hex = "0.4"
+p256 = { version = "0.14", features = ["ecdsa"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+thiserror = "2"
+
+[profile.release]
+# Overflow checks stay on: arithmetic in the decision path must fail loudly,
+# never wrap silently and produce a different (but "valid") decision.
+overflow-checks = true
