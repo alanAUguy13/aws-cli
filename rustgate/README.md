@@ -27,14 +27,14 @@ External Actor -> Identity/Authentication -> Authorization -> API & Security Edg
 | Observation Store | `observation::ObservationStore` | Append-only, content-addressed, idempotent, with provenance metadata |
 | Fact Normalization | `fact::FactNormalizer` | Canonical mapping, quality rules, confidence thresholds, and exact decimal→fixed-point conversion (no floats). Mapping rules are content-addressed and every version is kept, so any fact can be re-derived |
 | Fact Store | `fact::FactStore` | Fact registry and "as of t" snapshots with a total, reproducible ordering |
-| Governed Policy | `policy::PolicyRepository` | Signed authorship, N-of-M approvals, separation of duties, immutable monotonic versions |
+| Governed Policy | `policy::PolicyRepository` | Signed authorship, N-of-M approvals, separation of duties, immutable monotonic versions. Activation requires an authenticated principal with `ActivatePolicy` in the policy's tenant |
 | Compiled Policy | `policy::PolicyCompiler`, `CompiledPolicyStore` | Syntax and semantic checks against the fact catalog, conflict detection, reachability warnings, content-addressed stack bytecode |
 | Deterministic Decision Engine | `engine::evaluate` | Pure function with no clock, randomness, I/O or floats. Priority and severity resolution, temporal operators, full trace |
 | Decision Service | `decision::DecisionService` | Decision records, explanations, decision hashing, authority of record |
 | Evidence Generator / Repository | `evidence` | Provenance, the observation→fact→policy→decision→evidence→signature chain, hash-chained records, offline `EvidenceBundle` |
 | Audit Ledger / Event Ledger | `ledger` | Hash-chained, correlation- and causation-linked, tamper-evident |
 | Replay Engine / Validation | `replay` | Exact replay (match, drift, engine mismatch, unverifiable) and a separate re-decision that classifies policy drift and late-fact drift |
-| Action Authorization / Enforcement | `enforcement` | Actions run only after evidence is sealed and verified and an explicit tenant grant exists. No partial enforcement. Idempotent dispatch, including across restarts |
+| Action Authorization / Enforcement | `enforcement` | Actions run only after evidence is sealed and verified and an explicit tenant grant exists. No partial enforcement. Intent/receipt protocol: a durable intent before each connector call, a durable receipt after; after a crash, in-doubt actions are reconciled with the external system before anything is re-executed |
 | Durable storage | `storage` | Hash-chained write-ahead journal: in-memory, append-only file, or PostgreSQL with database-enforced WORM |
 
 ## Design choices worth knowing
@@ -54,6 +54,8 @@ External Actor -> Identity/Authentication -> Authorization -> API & Security Edg
   and require a bit-identical result, so a forged fact is caught even if it was consistently re-hashed.
 - **Replay vs. re-decision.** Replay answers "is the record authentic and the engine deterministic?"
   Re-decision answers "would we decide differently today, and is that because of the policy or the facts?"
+  Fact drift is judged against the facts the *original* policy reads, and an outcome counts as changed
+  when either the effect or the enforcement actions differ.
 
 ## Durable storage
 
@@ -66,8 +68,8 @@ code path. The in-memory stores are the query layer; the journal is the source o
   that carry no hash of their own, makes the journal refuse to open. `journal_head()` gives the value
   to publish to an external witness, which also makes truncation to a shorter valid prefix detectable.
 - **What is journaled:** observations, facts, mapping versions, policy submissions, approvals, compiled
-  binaries, activations, decisions, evidence, both ledgers, and enforcement receipts (so a restarted
-  instance never re-executes an action).
+  binaries, activations, decisions, evidence, both ledgers, and enforcement intents and receipts (so a
+  restarted instance never re-executes an action that already happened).
 - **What is configuration:** keys, identities, roles, schemas, connectors and grants. The deployment
   supplies these on every start from its KMS and IdP. Re-registering the active mapping rules is a no-op.
 - **Failure handling.** If a record fails to apply after it was made durable, the instance becomes
@@ -77,7 +79,7 @@ code path. The in-memory stores are the query layer; the journal is the source o
 |---|---|---|
 | `MemoryJournal` | Tests, ephemeral instances | None beyond the process |
 | `FileJournal` | Single node, edge devices | Append-only JSON lines, optional fsync per entry, torn final write truncated on open, corrupt complete lines rejected. Pair with `chattr +a` or a WORM volume |
-| `postgres::PostgresJournal` (feature `postgres`) | Servers | Schema in `sql/postgres.sql`. Triggers reject UPDATE, DELETE and TRUNCATE and enforce chain linkage and sequence continuity. Many instances share one table by `stream`. Grant the app role only INSERT and SELECT |
+| `postgres::PostgresJournal` (feature `postgres`) | Servers | Schema in `sql/postgres.sql`, installed once by the owner role with `PostgresJournal::migrate`. The app connects with a role holding only INSERT and SELECT, so it cannot alter or drop the table or its triggers. Triggers reject UPDATE, DELETE and TRUNCATE and enforce chain linkage and sequence continuity. Many instances share one table by `stream` |
 
 Object stores with retention locks (for example S3 Object Lock in compliance mode) fit the same trait:
 the file format is already append-only JSON lines, so sealed files can be shipped as immutable objects.

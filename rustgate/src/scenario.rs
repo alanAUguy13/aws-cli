@@ -30,6 +30,7 @@ pub const OPS_TOKEN: &str = "tok-ops-service";
 pub const AUDITOR_TOKEN: &str = "tok-auditor";
 pub const CAMERA_TOKEN: &str = "tok-cam-aisle-7";
 pub const SENSOR_TOKEN: &str = "tok-sensor-cooler-3";
+pub const RELEASE_TOKEN: &str = "tok-release-pipeline";
 
 pub struct ShelfCat {
     pub gate: RustGate,
@@ -81,6 +82,7 @@ impl ShelfCat {
             (SENSOR, ActorKind::Sensor, "telemetry-source", SENSOR_TOKEN),
             ("ops-service", ActorKind::Service, "decider", OPS_TOKEN),
             ("auditor", ActorKind::User, "auditor", AUDITOR_TOKEN),
+            ("release-pipeline", ActorKind::Service, "policy-admin", RELEASE_TOKEN),
         ];
         for (id, kind, role, token) in principals {
             gate.identity.register_principal(Principal { id: id.into(), tenant: TENANT.into(), kind, roles: roles(&[role]) });
@@ -98,6 +100,7 @@ impl ShelfCat {
             .define_role("decider", Role { permissions: [Permission::RequestDecision, Permission::Replay].into(), allowed_schemas: None });
         gate.authorizer
             .define_role("auditor", Role { permissions: [Permission::Replay, Permission::ReadEvidence].into(), allowed_schemas: None });
+        gate.authorizer.define_role("policy-admin", Role { permissions: [Permission::ActivatePolicy].into(), allowed_schemas: None });
 
         // Observation layer.
         gate.gateway.register_tenant(TENANT);
@@ -246,7 +249,7 @@ impl ShelfCat {
         self.gate.submit_policy(Self::policy(version, threshold_mc), &self.alice, at)?;
         self.gate.approve_policy(POLICY_ID, version, &self.bob, at + 1)?;
         self.gate.approve_policy(POLICY_ID, version, &self.carol, at + 2)?;
-        self.gate.compile_and_activate(POLICY_ID, version, "release-pipeline", at + 3)
+        self.gate.compile_and_activate(RELEASE_TOKEN, POLICY_ID, version, at + 3)
     }
 
     fn next_nonce(&mut self) -> String {

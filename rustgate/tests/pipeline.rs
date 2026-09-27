@@ -274,7 +274,10 @@ fn policy_governance() {
     let mut s = ShelfCat::new();
     s.gate.submit_policy(ShelfCat::policy(1, 5_000), &s.alice, T0).unwrap();
     // Not approved yet.
-    assert!(matches!(s.gate.compile_and_activate(POLICY_ID, 1, "ci", T0), Err(GovError::PolicyNotApproved { have: 0, need: 2, .. })));
+    assert!(matches!(
+        s.gate.compile_and_activate(RELEASE_TOKEN, POLICY_ID, 1, T0),
+        Err(GovError::PolicyNotApproved { have: 0, need: 2, .. })
+    ));
     // Author can't approve own policy, even with an approver key.
     let alice_approver = LocalP256Signer::from_seed("alice/approver", "alice-approver");
     assert!(matches!(s.gate.approve_policy(POLICY_ID, 1, &alice_approver, T0), Err(GovError::SeparationOfDuties(_))));
@@ -282,9 +285,18 @@ fn policy_governance() {
     assert!(matches!(s.gate.approve_policy(POLICY_ID, 1, &s.alice, T0), Err(GovError::SignatureRejected(_))));
     s.gate.approve_policy(POLICY_ID, 1, &s.bob, T0 + 1).unwrap();
     assert!(matches!(s.gate.approve_policy(POLICY_ID, 1, &s.bob, T0 + 2), Err(GovError::SeparationOfDuties(_))));
-    assert!(s.gate.compile_and_activate(POLICY_ID, 1, "ci", T0).is_err());
+    assert!(s.gate.compile_and_activate(RELEASE_TOKEN, POLICY_ID, 1, T0).is_err());
     s.gate.approve_policy(POLICY_ID, 1, &s.carol, T0 + 3).unwrap();
-    s.gate.compile_and_activate(POLICY_ID, 1, "ci", T0 + 4).unwrap();
+    // Activation needs an authenticated principal holding ActivatePolicy.
+    assert!(matches!(s.gate.compile_and_activate(OPS_TOKEN, POLICY_ID, 1, T0 + 4), Err(GovError::Forbidden { .. })));
+    assert!(matches!(s.gate.compile_and_activate("forged", POLICY_ID, 1, T0 + 4), Err(GovError::Unauthenticated(_))));
+    assert!(s.gate.policies.active(TENANT, POLICY_ID).is_err(), "nothing activated by refused callers");
+    let compiled = s.gate.compile_and_activate(RELEASE_TOKEN, POLICY_ID, 1, T0 + 4).unwrap();
+    let activation = s.gate.audit.entries().iter().rev().find_map(|e| match &e.event {
+        rustgate::ledger::AuditEvent::Policy { actor, policy_hash: Some(h), .. } if *h == compiled.policy_hash => Some(actor.clone()),
+        _ => None,
+    });
+    assert_eq!(activation.as_deref(), Some("release-pipeline"), "audit names the authenticated principal");
     // Versions are monotonic and immutable.
     assert!(matches!(s.gate.submit_policy(ShelfCat::policy(1, 1), &s.alice, T0), Err(GovError::PolicyVersionExists { .. })));
 }
@@ -320,7 +332,7 @@ fn compiler_semantic_and_conflict_checks() {
     s.gate.submit_policy(src, &s.alice, T0).unwrap();
     s.gate.approve_policy(POLICY_ID, 1, &s.bob, T0).unwrap();
     s.gate.approve_policy(POLICY_ID, 1, &s.carol, T0).unwrap();
-    match s.gate.compile_and_activate(POLICY_ID, 1, "ci", T0) {
+    match s.gate.compile_and_activate(RELEASE_TOKEN, POLICY_ID, 1, T0) {
         Err(GovError::Compilation(errs)) => {
             let all = errs.join("\n");
             assert!(all.contains("unknown fact 'cooler.humidity'"), "{all}");
@@ -343,7 +355,7 @@ fn action_authorization_blocks_ungranted_operations() {
     s.gate.submit_policy(src, &s.alice, T0).unwrap();
     s.gate.approve_policy(POLICY_ID, 1, &s.bob, T0).unwrap();
     s.gate.approve_policy(POLICY_ID, 1, &s.carol, T0).unwrap();
-    s.gate.compile_and_activate(POLICY_ID, 1, "ci", T0).unwrap();
+    s.gate.compile_and_activate(RELEASE_TOKEN, POLICY_ID, 1, T0).unwrap();
     s.observe_temperature(SHELF, 9.0, T0).unwrap();
     let d = s.decide(SHELF, T0 + 1_000, "c").unwrap();
     assert_eq!(d.decision.body.effect, Effect::Deny, "decision and evidence still stand");
@@ -357,4 +369,33 @@ fn cross_tenant_replay_is_forbidden() {
     s.observe_temperature(SHELF, 3.0, T0).unwrap();
     let d = s.decide(SHELF, T0 + 1_000, "c").unwrap();
     assert!(matches!(s.gate.replay(AUDITOR_TOKEN, "other-tenant", &d.decision.decision_hash, T0 + 2_000), Err(GovError::Forbidden { .. })));
+}
+
+#[test]
+fn re_decision_separates_policy_drift_from_fact_drift_and_sees_action_changes() {
+    let mut s = store_with_policy();
+    s.observe_temperature(SHELF, 7.2, T0).unwrap();
+    s.observe_stock(SHELF, "SKU-MILK-2L", 4, 0.99, T0 + 10).unwrap();
+    let d = s.decide(SHELF, T0 + 1_000, "c").unwrap();
+    assert_eq!(d.decision.body.effect, Effect::Deny);
+    assert_eq!(d.decision.body.fact_hashes.len(), 2);
+
+    // v2: still denies the breach, but no longer places a POS hold, and no
+    // longer reads shelf facings at all. No new facts arrive.
+    let mut v2 = ShelfCat::policy(2, 5_000);
+    v2.rules.retain(|r| r.id != "out-of-stock");
+    v2.rules[1].actions.retain(|a| a.connector != "pos");
+    s.gate.submit_policy(v2, &s.alice, T0 + 2_000).unwrap();
+    s.gate.approve_policy(POLICY_ID, 2, &s.bob, T0 + 2_001).unwrap();
+    s.gate.approve_policy(POLICY_ID, 2, &s.carol, T0 + 2_002).unwrap();
+    s.gate.compile_and_activate(RELEASE_TOKEN, POLICY_ID, 2, T0 + 2_003).unwrap();
+
+    let r = s.gate.replay(AUDITOR_TOKEN, TENANT, &d.decision.decision_hash, T0 + 3_000).unwrap();
+    assert_eq!(r.verdict, ReplayVerdict::Match);
+    let rd = r.re_decision.unwrap();
+    assert!(rd.policy_changed);
+    assert!(!rd.facts_changed, "dropping a fact reference is policy drift, not fact drift");
+    assert!(!rd.effect_changed);
+    assert!(rd.actions_changed && rd.outcome_changed, "same effect, different enforcement");
+    assert_eq!(rd.decisive_rule.as_deref(), Some("cold-chain-breach"));
 }

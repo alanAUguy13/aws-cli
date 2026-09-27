@@ -227,6 +227,7 @@ impl RustGate {
             JournalRecord::EventAppended { entry } => {
                 self.events.push(entry)?;
             }
+            JournalRecord::ActionIntent { request } => self.enforcement.restore_intent(request),
             JournalRecord::ActionCompleted { idempotency_key, receipt } => self.enforcement.restore_receipt(idempotency_key, receipt),
         }
         Ok(())
@@ -395,9 +396,17 @@ impl RustGate {
     }
 
     /// Verify approvals, compile against the current fact catalog, store the
-    /// binary and make it the active version.
-    pub fn compile_and_activate(&mut self, id: &str, version: u32, actor: &str, at: u64) -> Result<policy::CompiledPolicy> {
+    /// binary and make it the active version. The caller must authenticate
+    /// and hold [`Permission::ActivatePolicy`] in the policy's tenant; the
+    /// audit record names the authenticated principal.
+    pub fn compile_and_activate(&mut self, token: &str, id: &str, version: u32, at: u64) -> Result<policy::CompiledPolicy> {
         let correlation = format!("policy:{id}@{version}");
+        let tenant = self
+            .policy_repo
+            .get(id, version)
+            .map(|r| r.source.tenant.clone())
+            .ok_or_else(|| GovError::PolicyNotFound(format!("{id}@{version}")))?;
+        let principal = self.admit(token, Permission::ActivatePolicy, &tenant, None, &correlation, at)?;
         let result = (|| {
             let record = self.policy_repo.get(id, version).ok_or_else(|| GovError::PolicyNotFound(format!("{id}@{version}")))?;
             let approvers = self.policy_repo.verify_approved(record, &self.trust)?;
@@ -412,7 +421,7 @@ impl RustGate {
             at,
             &correlation,
             None,
-            AuditEvent::Policy { action, policy_id: id.into(), version, actor: actor.into(), policy_hash: hash },
+            AuditEvent::Policy { action, policy_id: id.into(), version, actor: principal.id, policy_hash: hash },
         )?;
         let compiled = result?;
         if !self.policies.contains(&compiled.policy_hash) {
@@ -481,7 +490,7 @@ impl RustGate {
 
         // Action authorisation -> enforcement.
         let (dispatches, actions_refused) = match self.action_authorizer.authorize(&decision, Some(&evidence), &self.trust) {
-            Ok(reqs) => (self.enforcement.dispatch(reqs), None),
+            Ok(reqs) => (self.dispatch_durably(reqs)?, None),
             Err(e) => {
                 self.audit(
                     at,
@@ -501,7 +510,11 @@ impl RustGate {
                         operation: d.request.operation.clone(),
                         external_ref: r.external_ref.clone(),
                     },
-                    if d.deduplicated { format!("deduplicated:{}", r.external_ref) } else { format!("dispatched:{}", r.external_ref) },
+                    match (d.deduplicated, d.reconciled) {
+                        (true, _) => format!("deduplicated:{}", r.external_ref),
+                        (false, true) => format!("reconciled:{}", r.external_ref),
+                        (false, false) => format!("dispatched:{}", r.external_ref),
+                    },
                 ),
                 Err(e) => (
                     DomainEvent::ActionFailed {
@@ -514,11 +527,6 @@ impl RustGate {
                 ),
             };
             if !d.deduplicated {
-                if let Ok(receipt) = &d.result {
-                    // Persist the receipt so a restarted instance never
-                    // re-executes this action.
-                    self.commit(JournalRecord::ActionCompleted { idempotency_key: d.request.idempotency_key, receipt: receipt.clone() })?;
-                }
                 self.event(at, &request.correlation_id, Some(sealed), event)?;
             }
             self.audit(
@@ -535,6 +543,34 @@ impl RustGate {
         }
 
         Ok(DecisionOutcome { decision, evidence, dispatches, actions_refused })
+    }
+
+    /// Intent/receipt protocol: journal the intent, call the connector
+    /// (reconciling first if a previous attempt left the action in doubt),
+    /// journal the receipt. A crash at any point is recoverable without
+    /// executing an action twice, given a connector that honours the
+    /// [`enforcement::Connector`] idempotency contract.
+    fn dispatch_durably(&mut self, requests: Vec<enforcement::DispatchRequest>) -> Result<Vec<DispatchOutcome>> {
+        let mut outcomes = Vec::with_capacity(requests.len());
+        for request in requests {
+            let key = request.idempotency_key;
+            if let Some(r) = self.enforcement.completed(&key) {
+                outcomes.push(DispatchOutcome { result: Ok(r.clone()), request, deduplicated: true, reconciled: false });
+                continue;
+            }
+            let in_doubt = self.enforcement.is_in_doubt(&key);
+            if !in_doubt {
+                self.commit(JournalRecord::ActionIntent { request: request.clone() })?;
+            }
+            match self.enforcement.execute(&request, in_doubt) {
+                Ok((receipt, reconciled)) => {
+                    self.commit(JournalRecord::ActionCompleted { idempotency_key: key, receipt: receipt.clone() })?;
+                    outcomes.push(DispatchOutcome { result: Ok(receipt), request, deduplicated: false, reconciled });
+                }
+                Err(e) => outcomes.push(DispatchOutcome { result: Err(e), request, deduplicated: false, reconciled: false }),
+            }
+        }
+        Ok(outcomes)
     }
 
     pub fn replay(&mut self, token: &str, tenant: &str, decision_hash: &Digest, at: u64) -> Result<ReplayReport> {

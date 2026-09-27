@@ -46,8 +46,17 @@ impl ReplayVerdict {
 pub struct ReDecision {
     pub policy_hash: Digest,
     pub effect: Effect,
+    pub decisive_rule: Option<String>,
+    /// The currently active policy differs from the one that decided.
     pub policy_changed: bool,
+    /// The facts the *original* policy depends on differ at `as_of` from the
+    /// ones it saw (late arrivals). Independent of which policy is active.
     pub facts_changed: bool,
+    pub effect_changed: bool,
+    /// The enforcement actions (templates) differ, even if the effect doesn't.
+    pub actions_changed: bool,
+    /// `effect_changed || actions_changed`: acting on this decision today
+    /// would do something materially different.
     pub outcome_changed: bool,
 }
 
@@ -88,13 +97,26 @@ impl ReplayEngine<'_> {
         let re_decision = self.policies.active(&d.tenant, &d.policy_id).ok().and_then(|active| {
             let snapshot = self.facts.snapshot(&d.tenant, &d.subject, d.as_of);
             let eval = engine::evaluate(&active.program, &snapshot).ok()?;
-            let facts_changed = eval.used_facts != d.fact_hashes;
+            // Fact drift is judged against what the *original* policy reads,
+            // so a new policy referencing different facts is not mistaken
+            // for new facts having arrived.
+            let original_inputs: Vec<&String> = match self.policies.get(&d.policy_hash) {
+                Ok(original) => original.program.fact_table.iter().collect(),
+                Err(_) => d.fact_hashes.keys().collect(),
+            };
+            let current: std::collections::BTreeMap<String, Digest> =
+                original_inputs.into_iter().filter_map(|name| snapshot.facts.get(name).map(|f| (name.clone(), f.fact_hash))).collect();
+            let effect_changed = eval.effect != d.effect;
+            let actions_changed = eval.actions != d.actions;
             Some(ReDecision {
                 policy_hash: active.policy_hash,
                 effect: eval.effect,
+                decisive_rule: eval.decisive_rule,
                 policy_changed: active.policy_hash != d.policy_hash,
-                facts_changed,
-                outcome_changed: eval.effect != d.effect,
+                facts_changed: current != d.fact_hashes,
+                effect_changed,
+                actions_changed,
+                outcome_changed: effect_changed || actions_changed,
             })
         });
 

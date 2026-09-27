@@ -3,12 +3,15 @@
 
 use std::path::PathBuf;
 
+use rustgate::enforcement::{Connector, DispatchRequest, Receipt};
 use rustgate::error::GovError;
 use rustgate::fact::{MappingRule, QualityRule, ValueMapping};
 use rustgate::policy::Effect;
 use rustgate::replay::ReplayVerdict;
 use rustgate::scenario::*;
-use rustgate::storage::FileJournal;
+use rustgate::storage::{FileJournal, Journal, JournalEntry};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 const SHELF: &str = "cooler-3/shelf-2";
 
@@ -207,6 +210,101 @@ fn bundle_rederives_facts_from_observations() {
     assert!(forged.verify(&s.gate.trust).is_err());
 }
 
+/// An external system (think ServiceNow) that outlives RustGate restarts.
+/// Deliberately *weak*: `execute` is not idempotent (every call creates a
+/// new record), so only RustGate's intent + lookup reconciliation can
+/// prevent a duplicate after a crash.
+#[derive(Default)]
+struct ExternalSystem {
+    executions: Vec<Digest>,
+    receipts: BTreeMap<Digest, Receipt>,
+}
+
+type Digest = rustgate::Digest;
+
+struct SharedConnector(&'static str, Arc<Mutex<ExternalSystem>>);
+
+impl Connector for SharedConnector {
+    fn execute(&mut self, req: &DispatchRequest) -> Result<Receipt, String> {
+        let mut sys = self.1.lock().unwrap();
+        sys.executions.push(req.idempotency_key);
+        let r = Receipt { connector: self.0.into(), external_ref: format!("EXT-{}", sys.executions.len()) };
+        sys.receipts.insert(req.idempotency_key, r.clone());
+        Ok(r)
+    }
+
+    fn lookup(&mut self, key: &Digest) -> Result<Option<Receipt>, String> {
+        Ok(self.1.lock().unwrap().receipts.get(key).cloned())
+    }
+}
+
+/// Journal that "crashes" (fails the append) when asked to persist the
+/// first record of a given kind.
+struct CrashingJournal {
+    inner: FileJournal,
+    crash_on: &'static str,
+}
+
+impl Journal for CrashingJournal {
+    fn append(&mut self, entry: &JournalEntry) -> rustgate::Result<()> {
+        if entry.record.kind() == self.crash_on {
+            return Err(GovError::Storage("simulated crash".into()));
+        }
+        self.inner.append(entry)
+    }
+    fn load(&mut self) -> rustgate::Result<Vec<JournalEntry>> {
+        self.inner.load()
+    }
+    fn describe(&self) -> String {
+        "crashing".into()
+    }
+}
+
+fn wire(s: &mut ShelfCat, ext: &Arc<Mutex<ExternalSystem>>) {
+    s.gate.enforcement.register("pos", Box::new(SharedConnector("pos", ext.clone())));
+    s.gate.enforcement.register("servicenow", Box::new(SharedConnector("servicenow", ext.clone())));
+}
+
+#[test]
+fn crash_between_execution_and_receipt_does_not_repeat_the_action() {
+    let path = tmp("crash");
+    let ext = Arc::new(Mutex::new(ExternalSystem::default()));
+    {
+        let journal = CrashingJournal { inner: FileJournal::open(&path, true).unwrap(), crash_on: "action_completed" };
+        let mut s = ShelfCat::with_journal(Box::new(journal)).unwrap();
+        wire(&mut s, &ext);
+        s.publish_policy(1, 5_000, T0 - MINUTE).unwrap();
+        s.observe_temperature(SHELF, 9.0, T0).unwrap();
+        // The POS hold executes externally, then the process dies before
+        // its receipt is durable.
+        assert!(s.decide(SHELF, T0 + 1_000, "c").is_err());
+    }
+    assert_eq!(ext.lock().unwrap().executions.len(), 1);
+
+    let mut s = open(&path).unwrap();
+    wire(&mut s, &ext);
+    assert_eq!(s.gate.enforcement.in_doubt().count(), 1, "the intent survived; the receipt did not");
+    let d = s.decide(SHELF, T0 + 1_000, "c-retry").unwrap();
+    assert_eq!(d.dispatches.len(), 2);
+    assert!(d.dispatches[0].reconciled, "in-doubt POS hold recovered by lookup, not re-executed");
+    assert!(!d.dispatches[1].reconciled && !d.dispatches[1].deduplicated, "incident executed for the first time");
+    assert_eq!(s.gate.enforcement.in_doubt().count(), 0);
+    {
+        let sys = ext.lock().unwrap();
+        assert_eq!(sys.executions.len(), 2, "each action executed exactly once");
+        assert_ne!(sys.executions[0], sys.executions[1]);
+    }
+
+    // And after another restart everything is simply deduplicated.
+    drop(s);
+    let mut s = open(&path).unwrap();
+    wire(&mut s, &ext);
+    let d = s.decide(SHELF, T0 + 1_000, "c-again").unwrap();
+    assert!(d.dispatches.iter().all(|x| x.deduplicated));
+    assert_eq!(ext.lock().unwrap().executions.len(), 2);
+    std::fs::remove_file(path).unwrap();
+}
+
 #[cfg(feature = "postgres")]
 mod postgres {
     use super::*;
@@ -222,6 +320,36 @@ mod postgres {
         ShelfCat::with_journal(Box::new(PostgresJournal::connect(url, stream)?))
     }
 
+    /// Install the schema as the owner and create an application role that
+    /// holds only SELECT and INSERT, as the schema file recommends. Returns
+    /// the application role's connection string.
+    fn migrate_and_create_app_role(admin_url: &str) -> String {
+        let mut admin = ::postgres::Client::connect(admin_url, ::postgres::NoTls).unwrap();
+        PostgresJournal::migrate(&mut admin).unwrap();
+        admin
+            .batch_execute(
+                "DO $$ BEGIN
+                     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'rustgate_app') THEN
+                         CREATE ROLE rustgate_app LOGIN PASSWORD 'rustgate_app';
+                     END IF;
+                 END $$;
+                 REVOKE ALL ON rustgate_journal FROM PUBLIC;
+                 GRANT SELECT, INSERT ON rustgate_journal TO rustgate_app;",
+            )
+            .unwrap();
+        // Later keys override earlier ones in libpq-style connection strings.
+        format!("{admin_url} user=rustgate_app password=rustgate_app")
+    }
+
+    #[test]
+    fn postgres_connect_requires_migration() {
+        let Some(url) = url() else { return };
+        let mut admin = ::postgres::Client::connect(&url, ::postgres::NoTls).unwrap();
+        admin.batch_execute("CREATE SCHEMA IF NOT EXISTS rustgate_empty").unwrap();
+        let err = PostgresJournal::connect(&format!("{url} options=-csearch_path=rustgate_empty"), "x").err().unwrap();
+        assert!(err.to_string().contains("run PostgresJournal::migrate"), "{err}");
+    }
+
     #[test]
     fn postgres_journal_restart_and_worm() {
         let Some(url) = url() else {
@@ -229,17 +357,27 @@ mod postgres {
             return;
         };
         let stream = format!("it-{}-{}", std::process::id(), T0);
+        let app_url = migrate_and_create_app_role(&url);
         let (report, h) = {
-            let mut s = open_pg(&url, &stream).unwrap();
+            // The whole workload runs as the restricted application role.
+            let mut s = open_pg(&app_url, &stream).unwrap();
             let h = workload(&mut s);
             (serde_json::to_value(s.gate.verify_integrity().unwrap()).unwrap(), h)
         };
-        let mut s = open_pg(&url, &stream).unwrap();
+        let mut s = open_pg(&app_url, &stream).unwrap();
         assert_eq!(serde_json::to_value(s.gate.verify_integrity().unwrap()).unwrap(), report);
         s.gate.verify_journal().unwrap();
         assert_eq!(s.gate.replay(AUDITOR_TOKEN, TENANT, &h, T0 + 5_000).unwrap().verdict, ReplayVerdict::Match);
 
-        // The database refuses to rewrite history.
+        // The app role has no DDL rights: it cannot drop the table or the
+        // triggers that protect it.
+        let mut app = PostgresJournal::connect(&app_url, &stream).unwrap();
+        for sql in ["DROP TRIGGER rustgate_journal_no_update_delete ON rustgate_journal", "DROP TABLE rustgate_journal"] {
+            let e = app.client().batch_execute(sql).unwrap_err();
+            assert!(e.as_db_error().unwrap().message().contains("owner"), "{e}");
+        }
+
+        // Even the owner cannot rewrite history while the triggers stand.
         let mut j = PostgresJournal::connect(&url, &stream).unwrap();
         let c = j.client();
         for sql in ["UPDATE rustgate_journal SET kind = 'x' WHERE stream = $1", "DELETE FROM rustgate_journal WHERE stream = $1"] {

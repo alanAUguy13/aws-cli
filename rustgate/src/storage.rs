@@ -17,6 +17,9 @@
 //!   torn-write recovery. Pair it with `chattr +a` or a WORM volume.
 //! * [`postgres::PostgresJournal`] (feature `postgres`): one table whose
 //!   triggers reject UPDATE, DELETE and TRUNCATE and enforce chain linkage.
+//!   The schema is installed by a privileged migration
+//!   ([`postgres::PostgresJournal::migrate`]); the application connects
+//!   with a role holding only `SELECT` and `INSERT`.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -26,7 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::canonical::{domain, hash_canonical, Digest};
 use crate::decision::DecisionRecord;
-use crate::enforcement::Receipt;
+use crate::enforcement::{DispatchRequest, Receipt};
 use crate::error::{GovError, Result};
 use crate::evidence::EvidenceRecord;
 use crate::fact::{Fact, MappingRule};
@@ -38,18 +41,49 @@ use crate::policy::{Approval, CompiledPolicy, PolicyRecord};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum JournalRecord {
-    MappingRegistered { rule: MappingRule },
-    ObservationStored { observation: StoredObservation },
-    FactStored { fact: Fact },
-    PolicySubmitted { record: PolicyRecord },
-    PolicyApproved { policy_id: String, version: u32, approval: Approval },
-    PolicyCompiled { policy: CompiledPolicy },
-    PolicyActivated { policy_hash: Digest },
-    DecisionRecorded { decision: DecisionRecord },
-    EvidenceSealed { evidence: EvidenceRecord },
-    AuditAppended { entry: LedgerEntry<AuditEvent> },
-    EventAppended { entry: LedgerEntry<DomainEvent> },
-    ActionCompleted { idempotency_key: Digest, receipt: Receipt },
+    MappingRegistered {
+        rule: MappingRule,
+    },
+    ObservationStored {
+        observation: StoredObservation,
+    },
+    FactStored {
+        fact: Fact,
+    },
+    PolicySubmitted {
+        record: PolicyRecord,
+    },
+    PolicyApproved {
+        policy_id: String,
+        version: u32,
+        approval: Approval,
+    },
+    PolicyCompiled {
+        policy: CompiledPolicy,
+    },
+    PolicyActivated {
+        policy_hash: Digest,
+    },
+    DecisionRecorded {
+        decision: DecisionRecord,
+    },
+    EvidenceSealed {
+        evidence: EvidenceRecord,
+    },
+    AuditAppended {
+        entry: LedgerEntry<AuditEvent>,
+    },
+    EventAppended {
+        entry: LedgerEntry<DomainEvent>,
+    },
+    /// Written before a connector is called (write-ahead intent).
+    ActionIntent {
+        request: DispatchRequest,
+    },
+    ActionCompleted {
+        idempotency_key: Digest,
+        receipt: Receipt,
+    },
 }
 
 impl JournalRecord {
@@ -66,6 +100,7 @@ impl JournalRecord {
             JournalRecord::EvidenceSealed { .. } => "evidence_sealed",
             JournalRecord::AuditAppended { .. } => "audit_appended",
             JournalRecord::EventAppended { .. } => "event_appended",
+            JournalRecord::ActionIntent { .. } => "action_intent",
             JournalRecord::ActionCompleted { .. } => "action_completed",
         }
     }
@@ -252,17 +287,30 @@ pub mod postgres {
     }
 
     impl PostgresJournal {
-        /// Connect and install the schema idempotently. `stream` names this
-        /// instance's journal, so several instances can share one database.
-        /// Use TLS (e.g. `postgres-native-tls`) through [`Self::from_client`]
-        /// for anything beyond a local socket.
+        /// Install or upgrade the schema. Run this once per deployment as
+        /// the table owner (a migration role), never as the application
+        /// role: DDL needs owner privileges the app role must not have.
+        pub fn migrate(client: &mut Client) -> Result<()> {
+            client.batch_execute(SCHEMA).map_err(pg_err)
+        }
+
+        /// Connect as the application role. Performs no DDL, so it works with
+        /// a role that holds only `SELECT` and `INSERT` on `rustgate_journal`.
+        /// `stream` names this instance's journal, so several instances can
+        /// share one database. Use TLS (e.g. `postgres-native-tls`) through
+        /// [`Self::from_client`] for anything beyond a local socket.
         pub fn connect(url: &str, stream: &str) -> Result<Self> {
             let client = Client::connect(url, NoTls).map_err(pg_err)?;
             Self::from_client(client, stream)
         }
 
+        /// Wrap an existing connection. Fails fast if the schema has not been
+        /// installed with [`Self::migrate`].
         pub fn from_client(mut client: Client, stream: &str) -> Result<Self> {
-            client.batch_execute(SCHEMA).map_err(pg_err)?;
+            let installed: bool = client.query_one("SELECT to_regclass('rustgate_journal') IS NOT NULL", &[]).map_err(pg_err)?.get(0);
+            if !installed {
+                return Err(GovError::Storage("rustgate_journal is missing: run PostgresJournal::migrate as the owner role first".into()));
+            }
             Ok(Self { client, stream: stream.to_string() })
         }
 

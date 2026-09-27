@@ -9,8 +9,10 @@
 -- RustGate additionally re-verifies every hash when it loads the stream, so a
 -- privileged user who disables the triggers still cannot tamper undetected.
 --
--- For production, run the application as a role that holds only INSERT and
--- SELECT on this table, e.g.:
+-- Install this file as the owner/migration role (PostgresJournal::migrate).
+-- Run the application as a role that holds only INSERT and SELECT on this
+-- table; it never needs DDL, and without ownership it cannot disable the
+-- triggers. E.g.:
 --   REVOKE ALL ON rustgate_journal FROM PUBLIC;
 --   GRANT SELECT, INSERT ON rustgate_journal TO rustgate_app;
 
