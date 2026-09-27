@@ -144,36 +144,70 @@ impl PolicyRepository {
     }
 
     pub fn submit(&mut self, source: PolicySource, author: &dyn EvidenceSigner, trust: &TrustStore, at: u64) -> Result<Digest> {
-        let key = (source.id.clone(), source.version);
-        if self.records.contains_key(&key) {
-            return Err(GovError::PolicyVersionExists { id: source.id, version: source.version });
+        let record = self.prepare_submit(source, author, trust, at)?;
+        let h = record.source_hash;
+        self.restore_submitted(record)?;
+        Ok(h)
+    }
+
+    fn check_new_version(&self, id: &str, version: u32) -> Result<()> {
+        let latest = self.records.range((id.to_string(), 0)..=(id.to_string(), u32::MAX)).next_back();
+        if latest.is_some_and(|((_, v), _)| version <= *v) {
+            return Err(GovError::PolicyVersionExists { id: id.into(), version });
         }
-        if let Some(((_, latest), _)) = self.records.range((source.id.clone(), 0)..=(source.id.clone(), u32::MAX)).next_back() {
-            if source.version <= *latest {
-                return Err(GovError::PolicyVersionExists { id: source.id, version: source.version });
-            }
-        }
+        Ok(())
+    }
+
+    /// Sign and validate a submission without storing it.
+    pub fn prepare_submit(&self, source: PolicySource, author: &dyn EvidenceSigner, trust: &TrustStore, at: u64) -> Result<PolicyRecord> {
+        self.check_new_version(&source.id, source.version)?;
         let source_hash = source.source_hash()?;
         let author_signature = author.sign(source_hash.as_bytes());
         let key_info = trust.verify(source_hash.as_bytes(), &author_signature, KeyPurpose::PolicyAuthor, None, at)?;
-        let record =
-            PolicyRecord { author: key_info.owner.clone(), source, source_hash, submitted_at: at, author_signature, approvals: Vec::new() };
-        self.records.insert(key, record);
-        Ok(source_hash)
+        Ok(PolicyRecord { author: key_info.owner.clone(), source, source_hash, submitted_at: at, author_signature, approvals: Vec::new() })
+    }
+
+    /// Store a submission (live path or journal recovery). Signatures are
+    /// re-checked by [`PolicyRepository::verify_approved`] before compiling.
+    pub fn restore_submitted(&mut self, record: PolicyRecord) -> Result<()> {
+        self.check_new_version(&record.source.id, record.source.version)?;
+        if record.source.source_hash()? != record.source_hash || !record.approvals.is_empty() {
+            return Err(GovError::Integrity(format!("policy {} submission record is inconsistent", record.source.id)));
+        }
+        self.records.insert((record.source.id.clone(), record.source.version), record);
+        Ok(())
     }
 
     pub fn approve(&mut self, id: &str, version: u32, approver: &dyn EvidenceSigner, trust: &TrustStore, at: u64) -> Result<usize> {
-        let record = self.records.get_mut(&(id.to_string(), version)).ok_or_else(|| GovError::PolicyNotFound(format!("{id}@{version}")))?;
+        let approval = self.prepare_approval(id, version, approver, trust, at)?;
+        self.restore_approval(id, version, approval)
+    }
+
+    /// Sign and validate an approval without storing it.
+    pub fn prepare_approval(&self, id: &str, version: u32, approver: &dyn EvidenceSigner, trust: &TrustStore, at: u64) -> Result<Approval> {
+        let record = self.records.get(&(id.to_string(), version)).ok_or_else(|| GovError::PolicyNotFound(format!("{id}@{version}")))?;
         let msg = approval_message(&record.source_hash, at);
         let signature = approver.sign(msg.as_bytes());
         let key = trust.verify(msg.as_bytes(), &signature, KeyPurpose::PolicyApprover, None, at)?;
-        if key.owner == record.author {
-            return Err(GovError::SeparationOfDuties(format!("author '{}' cannot approve their own policy", key.owner)));
+        let approval = Approval { approver: key.owner.clone(), approved_at: at, signature };
+        Self::check_approval(record, &approval)?;
+        Ok(approval)
+    }
+
+    fn check_approval(record: &PolicyRecord, approval: &Approval) -> Result<()> {
+        if approval.approver == record.author {
+            return Err(GovError::SeparationOfDuties(format!("author '{}' cannot approve their own policy", approval.approver)));
         }
-        if record.approvals.iter().any(|a| a.approver == key.owner) {
-            return Err(GovError::SeparationOfDuties(format!("'{}' has already approved", key.owner)));
+        if record.approvals.iter().any(|a| a.approver == approval.approver) {
+            return Err(GovError::SeparationOfDuties(format!("'{}' has already approved", approval.approver)));
         }
-        record.approvals.push(Approval { approver: key.owner.clone(), approved_at: at, signature });
+        Ok(())
+    }
+
+    pub fn restore_approval(&mut self, id: &str, version: u32, approval: Approval) -> Result<usize> {
+        let record = self.records.get_mut(&(id.to_string(), version)).ok_or_else(|| GovError::PolicyNotFound(format!("{id}@{version}")))?;
+        Self::check_approval(record, &approval)?;
+        record.approvals.push(approval);
         Ok(record.approvals.len())
     }
 
@@ -477,10 +511,15 @@ pub struct CompiledPolicyStore {
 }
 
 impl CompiledPolicyStore {
-    pub fn insert(&mut self, policy: CompiledPolicy) -> Digest {
+    pub fn insert(&mut self, policy: CompiledPolicy) -> Result<Digest> {
+        policy.verify()?;
         let h = policy.policy_hash;
         self.by_hash.entry(h).or_insert(policy);
-        h
+        Ok(h)
+    }
+
+    pub fn contains(&self, hash: &Digest) -> bool {
+        self.by_hash.contains_key(hash)
     }
 
     pub fn activate(&mut self, hash: Digest) -> Result<()> {

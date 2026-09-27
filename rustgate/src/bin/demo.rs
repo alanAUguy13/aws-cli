@@ -1,9 +1,14 @@
 //! Walk the full RustGate pipeline on the ShelfCat reference scenario.
 //!
-//!     cargo run --bin rustgate-demo [-- --bundle out.json]
+//!     cargo run --bin rustgate-demo [-- --bundle out.json] [--journal store.jsonl]
+//!
+//! With `--journal`, state is persisted to an append-only file. Running the
+//! demo again on the same file recovers from the journal, re-verifies
+//! everything and replays every recorded decision.
 
 use rustgate::policy::Effect;
 use rustgate::scenario::*;
+use rustgate::storage::FileJournal;
 
 const SHELF: &str = "cooler-3/shelf-2";
 
@@ -12,8 +17,26 @@ fn step(title: &str) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let bundle_path = std::env::args().skip_while(|a| a != "--bundle").nth(1);
-    let mut s = ShelfCat::new();
+    let arg = |name: &str| std::env::args().skip_while(|a| a != name).nth(1);
+    let bundle_path = arg("--bundle");
+    let mut s = match arg("--journal") {
+        Some(path) => ShelfCat::with_journal(Box::new(FileJournal::open(path, true)?))?,
+        None => ShelfCat::new(),
+    };
+    println!("journal: {}", s.gate.journal_description());
+
+    if !s.gate.decisions.is_empty() {
+        step("Recovered from journal");
+        let report = s.gate.verify_integrity()?;
+        s.gate.verify_journal()?;
+        println!("{} entries, head {}", report.journal_entries, report.journal_head.short());
+        let hashes: Vec<_> = s.gate.decisions.iter().map(|d| d.decision_hash).collect();
+        for (i, h) in hashes.iter().enumerate() {
+            let r = s.gate.replay(AUDITOR_TOKEN, TENANT, h, T0 + (10 + i as u64) * MINUTE)?;
+            println!("replay {}: {} (evidence verified: {})", h.short(), r.verdict.label(), r.evidence_verified.is_ok());
+        }
+        return Ok(());
+    }
 
     step("Governed policy: author -> dual approval -> compile -> activate");
     let v1 = s.publish_policy(1, 5_000, T0 - 10 * MINUTE)?;
@@ -94,6 +117,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     step("Integrity");
     let report = s.gate.verify_integrity()?;
     println!("{}", serde_json::to_string_pretty(&report)?);
+    let (entries, head) = s.gate.verify_journal()?;
+    println!("durable journal verified: {entries} entries, head {}", head.short());
 
     step("Tamper: rewrite the denial as an allow");
     s.gate.decisions.get_mut_unchecked(&breach.decision.decision_hash).unwrap().body.effect = Effect::Allow;

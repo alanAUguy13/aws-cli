@@ -206,6 +206,33 @@ impl ObservationStore {
         self.records.get(hash)
     }
 
+    pub fn contains(&self, hash: &Digest) -> bool {
+        self.records.contains_key(hash)
+    }
+
+    pub fn next_seq(&self) -> u64 {
+        self.next_seq
+    }
+
+    /// Insert a record built elsewhere (live write path or journal recovery).
+    /// Rejects duplicates, sequence gaps and records whose content does not
+    /// match their hash.
+    pub fn restore(&mut self, stored: StoredObservation) -> Result<()> {
+        let hash = stored.envelope.body.content_hash()?;
+        if hash != stored.envelope.content_hash {
+            return Err(GovError::Integrity(format!("observation {} content does not match its hash", hash.short())));
+        }
+        if self.records.contains_key(&hash) {
+            return Err(GovError::Integrity(format!("observation {} already stored", hash.short())));
+        }
+        if stored.ingest_seq != self.next_seq {
+            return Err(GovError::Integrity(format!("observation sequence gap: expected {}, got {}", self.next_seq, stored.ingest_seq)));
+        }
+        self.next_seq += 1;
+        self.records.insert(hash, stored);
+        Ok(())
+    }
+
     pub fn len(&self) -> usize {
         self.records.len()
     }

@@ -16,6 +16,7 @@ use crate::identity::{ActorKind, Permission, Principal, Role};
 use crate::keys::{KeyPurpose, LocalP256Signer};
 use crate::observation::{FieldType, ObservationBody, ObservationSchema, SourceRef};
 use crate::policy::{ActionTemplate, CmpOp, Condition, Effect, PolicySource, RuleSource};
+use crate::storage::{Journal, MemoryJournal};
 use crate::{Config, DecisionOutcome, IngestReceipt, Result, RustGate};
 
 pub const TENANT: &str = "shelfcat-store-0042";
@@ -45,9 +46,17 @@ fn roles(names: &[&str]) -> std::collections::BTreeSet<String> {
 }
 
 impl ShelfCat {
+    /// Ephemeral store (in-memory journal).
     pub fn new() -> Self {
+        Self::with_journal(Box::new(MemoryJournal::default())).expect("in-memory journal opens")
+    }
+
+    /// Open (or re-open after a restart) a store over a durable journal.
+    /// Configuration is re-applied on every start; registering mappings that
+    /// are already active is a no-op, so nothing is re-journaled.
+    pub fn with_journal(journal: Box<dyn Journal>) -> Result<Self> {
         let evidence_key = LocalP256Signer::from_seed("rustgate-evidence-2026", "evidence");
-        let mut gate = RustGate::new(Config::default(), Box::new(evidence_key));
+        let mut gate = RustGate::open(Config::default(), Box::new(evidence_key), journal)?;
 
         // Keys and trust.
         let camera_key = LocalP256Signer::from_seed("cam-aisle-7/k1", "camera");
@@ -150,7 +159,7 @@ impl ShelfCat {
             },
         ];
         for m in mappings {
-            gate.normalizer.register(m).unwrap();
+            gate.register_mapping(m)?;
         }
 
         // Enforcement.
@@ -161,7 +170,7 @@ impl ShelfCat {
         gate.action_authorizer.grant(TENANT, "dynamics", "create_restock_task");
         gate.action_authorizer.grant(TENANT, "pos", "hold_sku");
 
-        Self { gate, camera_key, sensor_key, alice, bob, carol, nonce: 0 }
+        Ok(Self { gate, camera_key, sensor_key, alice, bob, carol, nonce: 0 })
     }
 
     /// The governed policy. `breach_threshold_mc` is in milli-degrees C.

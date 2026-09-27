@@ -15,6 +15,10 @@
 //!
 //! [`RustGate`] wires the components together. Each stage is also usable on
 //! its own through its module.
+//!
+//! State is durable through a write-ahead [`storage::Journal`]: every change
+//! is appended to the journal before it is applied in memory, and
+//! [`RustGate::open`] rebuilds the stores by applying the same records.
 
 pub mod canonical;
 pub mod decision;
@@ -30,6 +34,7 @@ pub mod observation;
 pub mod policy;
 pub mod replay;
 pub mod scenario;
+pub mod storage;
 
 use std::collections::BTreeMap;
 
@@ -41,13 +46,14 @@ pub use error::{GovError, Result};
 use decision::{DecisionBody, DecisionRecord, DecisionRequest, DecisionService};
 use enforcement::{ActionAuthorizer, DispatchOutcome, EnforcementService};
 use evidence::{EvidenceBundle, EvidenceGenerator, EvidenceRecord, EvidenceRepository};
-use fact::{Fact, FactNormalizer, FactStore};
+use fact::{Fact, FactNormalizer, FactStore, MappingRule};
 use identity::{Authorizer, EdgeConfig, IdentityProvider, Permission, Principal, SecurityEdge};
 use keys::{EvidenceSigner, TrustStore};
 use ledger::{AuditEvent, AuditLedger, DomainEvent, EventLedger};
-use observation::{Appended, ObservationEnvelope, ObservationGateway, ObservationStore};
+use observation::{ObservationEnvelope, ObservationGateway, ObservationStore, StoredObservation};
 use policy::{CompiledPolicyStore, PolicyCompiler, PolicyRepository, PolicySource};
 use replay::{ReplayEngine, ReplayReport};
+use storage::{Journal, JournalEntry, JournalRecord, MemoryJournal};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestReceipt {
@@ -77,6 +83,8 @@ pub struct IntegrityReport {
     pub audit_head: Digest,
     pub event_head: Digest,
     pub evidence_head: Digest,
+    pub journal_entries: u64,
+    pub journal_head: Digest,
 }
 
 pub struct Config {
@@ -94,6 +102,12 @@ impl Default for Config {
 
 /// The assembled platform. Every mutating call takes an explicit timestamp:
 /// RustGate never reads a clock, which is what makes it replayable.
+///
+/// Durable state (observations, facts, mappings, policies, decisions,
+/// evidence, ledgers, enforcement receipts) lives in the journal.
+/// Configuration (trust store, identities, roles, schemas, connectors and
+/// grants) is supplied by the deployment on every start, from its key
+/// management and identity systems.
 pub struct RustGate {
     pub trust: TrustStore,
     pub identity: IdentityProvider,
@@ -112,11 +126,27 @@ pub struct RustGate {
     pub audit: AuditLedger,
     pub events: EventLedger,
     evidence_signer: Box<dyn EvidenceSigner>,
+    journal: Box<dyn Journal>,
+    journal_head: (u64, Digest),
+    /// Set if a durably journaled record failed to apply in memory; the
+    /// instance then refuses further writes until restarted from the journal.
+    poisoned: Option<String>,
 }
 
 impl RustGate {
+    /// An ephemeral instance backed by an in-memory journal.
     pub fn new(config: Config, evidence_signer: Box<dyn EvidenceSigner>) -> Self {
-        Self {
+        Self::open(config, evidence_signer, Box::new(MemoryJournal::default())).expect("an empty in-memory journal always opens")
+    }
+
+    /// Open an instance over `journal`, verifying the journal's hash chain
+    /// and rebuilding every store from it. Signature checks need the trust
+    /// store, so call [`RustGate::verify_integrity`] once configuration has
+    /// been loaded.
+    pub fn open(config: Config, evidence_signer: Box<dyn EvidenceSigner>, mut journal: Box<dyn Journal>) -> Result<Self> {
+        let entries = journal.load()?;
+        let head = storage::verify_chain(&entries)?;
+        let mut gate = Self {
             trust: TrustStore::new(),
             identity: IdentityProvider::default(),
             authorizer: Authorizer::default(),
@@ -134,11 +164,98 @@ impl RustGate {
             audit: AuditLedger::default(),
             events: EventLedger::default(),
             evidence_signer,
+            journal,
+            journal_head: head,
+            poisoned: None,
+        };
+        for e in entries {
+            let seq = e.seq;
+            gate.apply(e.record).map_err(|err| GovError::Storage(format!("journal entry #{seq} cannot be applied: {err}")))?;
         }
+        Ok(gate)
     }
 
     pub fn evidence_signer(&self) -> &dyn EvidenceSigner {
         self.evidence_signer.as_ref()
+    }
+
+    pub fn journal_description(&self) -> String {
+        self.journal.describe()
+    }
+
+    /// `(entries, last entry hash)`: publish this to an external witness to
+    /// make wholesale rewrites of the journal detectable too.
+    pub fn journal_head(&self) -> (u64, Digest) {
+        self.journal_head
+    }
+
+    /// Write-ahead: durably journal the change, then apply it.
+    fn commit(&mut self, record: JournalRecord) -> Result<()> {
+        if let Some(reason) = &self.poisoned {
+            return Err(GovError::Storage(format!("instance is read-only after a failed apply: {reason}")));
+        }
+        let (seq, prev) = self.journal_head;
+        let entry = JournalEntry::seal(seq, prev, record)?;
+        self.journal.append(&entry)?;
+        self.journal_head = (seq + 1, entry.entry_hash);
+        self.apply(entry.record).inspect_err(|e| self.poisoned = Some(format!("entry #{seq}: {e}")))
+    }
+
+    /// The single path by which state changes, live or during recovery.
+    fn apply(&mut self, record: JournalRecord) -> Result<()> {
+        match record {
+            JournalRecord::MappingRegistered { rule } => {
+                self.normalizer.register(rule)?;
+            }
+            JournalRecord::ObservationStored { observation } => self.observations.restore(observation)?,
+            JournalRecord::FactStored { fact } => {
+                self.facts.restore(fact)?;
+            }
+            JournalRecord::PolicySubmitted { record } => self.policy_repo.restore_submitted(record)?,
+            JournalRecord::PolicyApproved { policy_id, version, approval } => {
+                self.policy_repo.restore_approval(&policy_id, version, approval)?;
+            }
+            JournalRecord::PolicyCompiled { policy } => {
+                self.policies.insert(policy)?;
+            }
+            JournalRecord::PolicyActivated { policy_hash } => self.policies.activate(policy_hash)?,
+            JournalRecord::DecisionRecorded { decision } => self.decisions.restore(decision)?,
+            JournalRecord::EvidenceSealed { evidence } => self.evidence.append(evidence)?,
+            JournalRecord::AuditAppended { entry } => {
+                self.audit.push(entry)?;
+            }
+            JournalRecord::EventAppended { entry } => {
+                self.events.push(entry)?;
+            }
+            JournalRecord::ActionCompleted { idempotency_key, receipt } => self.enforcement.restore_receipt(idempotency_key, receipt),
+        }
+        Ok(())
+    }
+
+    fn audit(&mut self, at: u64, correlation: &str, causation: Option<Digest>, event: AuditEvent) -> Result<Digest> {
+        let entry = self.audit.prepare(at, correlation, causation, event)?;
+        let h = entry.entry_hash;
+        self.commit(JournalRecord::AuditAppended { entry })?;
+        Ok(h)
+    }
+
+    fn event(&mut self, at: u64, correlation: &str, causation: Option<Digest>, event: DomainEvent) -> Result<Digest> {
+        let entry = self.events.prepare(at, correlation, causation, event)?;
+        let h = entry.entry_hash;
+        self.commit(JournalRecord::EventAppended { entry })?;
+        Ok(h)
+    }
+
+    /// Register a fact mapping rule. Registering the version that is
+    /// already active is a no-op, so deployments can re-apply their mapping
+    /// configuration on every start.
+    pub fn register_mapping(&mut self, rule: MappingRule) -> Result<Digest> {
+        if self.normalizer.is_active(&rule)? {
+            return rule.hash();
+        }
+        let h = self.normalizer.check(&rule)?;
+        self.commit(JournalRecord::MappingRegistered { rule })?;
+        Ok(h)
     }
 
     /// Authentication + authorisation, with the outcome written to the
@@ -158,12 +275,12 @@ impl RustGate {
             Ok(p) => (Some(p.id.clone()), true, format!("{permission} on tenant '{tenant}'")),
             Err(e) => (None, false, e.to_string()),
         };
-        self.audit.append(at, correlation, None, AuditEvent::Security { action: permission.to_string(), principal, allowed, detail })?;
+        self.audit(at, correlation, None, AuditEvent::Security { action: permission.to_string(), principal, allowed, detail })?;
         result
     }
 
     fn audit_security_failure(&mut self, principal: &Principal, action: &str, err: &GovError, correlation: &str, at: u64) -> Result<()> {
-        self.audit.append(
+        self.audit(
             at,
             correlation,
             None,
@@ -202,8 +319,13 @@ impl RustGate {
 
         let source_id = envelope.body.source.id.clone();
         let schema = envelope.body.schema.clone();
-        let duplicate = matches!(self.observations.append(envelope, received_at, &principal.id), Appended::Duplicate(_));
-        let ingested = self.events.append(
+        let duplicate = self.observations.contains(&obs_hash);
+        if !duplicate {
+            let stored =
+                StoredObservation { envelope, received_at, ingest_seq: self.observations.next_seq(), submitted_by: principal.id.clone() };
+            self.commit(JournalRecord::ObservationStored { observation: stored })?;
+        }
+        let ingested = self.event(
             received_at,
             &correlation,
             None,
@@ -213,13 +335,14 @@ impl RustGate {
             return Ok(IngestReceipt { observation_hash: obs_hash, duplicate, fact_hashes: vec![], rejections: vec![] });
         }
 
-        let stored = self.observations.get(&obs_hash).expect("just appended");
-        let outcome = self.normalizer.normalize(stored);
+        let outcome = self.normalizer.normalize(self.observations.get(&obs_hash).expect("just stored"));
         let fact_hashes: Vec<Digest> = outcome.facts.iter().map(|f| f.fact_hash).collect();
-        for f in outcome.facts {
-            self.facts.insert(f);
+        for fact in outcome.facts {
+            if !self.facts.contains(&fact.fact_hash) {
+                self.commit(JournalRecord::FactStored { fact })?;
+            }
         }
-        self.events.append(
+        self.event(
             received_at,
             &correlation,
             Some(ingested),
@@ -234,8 +357,10 @@ impl RustGate {
 
     pub fn submit_policy(&mut self, source: PolicySource, author: &dyn EvidenceSigner, at: u64) -> Result<Digest> {
         let (id, version) = (source.id.clone(), source.version);
-        let h = self.policy_repo.submit(source, author, &self.trust, at)?;
-        self.audit.append(
+        let record = self.policy_repo.prepare_submit(source, author, &self.trust, at)?;
+        let h = record.source_hash;
+        self.commit(JournalRecord::PolicySubmitted { record })?;
+        self.audit(
             at,
             &format!("policy:{id}@{version}"),
             None,
@@ -245,8 +370,13 @@ impl RustGate {
     }
 
     pub fn approve_policy(&mut self, id: &str, version: u32, approver: &dyn EvidenceSigner, at: u64) -> Result<usize> {
-        let result = self.policy_repo.approve(id, version, approver, &self.trust, at);
-        self.audit.append(
+        let result = match self.policy_repo.prepare_approval(id, version, approver, &self.trust, at) {
+            Ok(approval) => self
+                .commit(JournalRecord::PolicyApproved { policy_id: id.into(), version, approval })
+                .map(|_| self.policy_repo.get(id, version).map_or(0, |r| r.approvals.len())),
+            Err(e) => Err(e),
+        };
+        self.audit(
             at,
             &format!("policy:{id}@{version}"),
             None,
@@ -278,15 +408,17 @@ impl RustGate {
             Ok(c) => ("compiled_and_activated".to_string(), Some(c.policy_hash)),
             Err(e) => (format!("compile_rejected: {e}"), None),
         };
-        self.audit.append(
+        self.audit(
             at,
             &correlation,
             None,
             AuditEvent::Policy { action, policy_id: id.into(), version, actor: actor.into(), policy_hash: hash },
         )?;
         let compiled = result?;
-        let h = self.policies.insert(compiled.clone());
-        self.policies.activate(h)?;
+        if !self.policies.contains(&compiled.policy_hash) {
+            self.commit(JournalRecord::PolicyCompiled { policy: compiled.clone() })?;
+        }
+        self.commit(JournalRecord::PolicyActivated { policy_hash: compiled.policy_hash })?;
         Ok(compiled)
     }
 
@@ -306,11 +438,12 @@ impl RustGate {
         let snapshot = self.facts.snapshot(&request.tenant, &request.subject, request.as_of);
         let eval = engine::evaluate(&policy.program, &snapshot)?;
         let body = DecisionBody::build(&policy, &snapshot, eval);
-        let (decision, is_new) = self.decisions.record(body, &request.correlation_id, &principal.id, at)?;
+        let (decision, is_new) = self.decisions.prepare(body, &request.correlation_id, &principal.id, at)?;
         let dh = decision.decision_hash;
 
         if is_new {
-            self.audit.append(
+            self.commit(JournalRecord::DecisionRecorded { decision: decision.clone() })?;
+            self.audit(
                 at,
                 &request.correlation_id,
                 None,
@@ -323,12 +456,8 @@ impl RustGate {
                 },
             )?;
         }
-        let made = self.events.append(
-            at,
-            &request.correlation_id,
-            None,
-            DomainEvent::DecisionMade { decision_hash: dh, effect: decision.body.effect },
-        )?;
+        let made =
+            self.event(at, &request.correlation_id, None, DomainEvent::DecisionMade { decision_hash: dh, effect: decision.body.effect })?;
 
         // Evidence (sealed once per decision hash).
         let evidence = match self.evidence.for_decision(&dh) {
@@ -339,11 +468,11 @@ impl RustGate {
                     used.iter().filter_map(|f| self.observations.get(&f.body.observation_hash)).map(|o| (o.hash(), &o.envelope)).collect();
                 let (seq, prev) = self.evidence.head();
                 let rec = EvidenceGenerator::seal(&decision, &policy, &used, &obs, seq, prev, at, self.evidence_signer.as_ref())?;
-                self.evidence.append(rec.clone())?;
+                self.commit(JournalRecord::EvidenceSealed { evidence: rec.clone() })?;
                 rec
             }
         };
-        let sealed = self.events.append(
+        let sealed = self.event(
             at,
             &request.correlation_id,
             Some(made),
@@ -354,7 +483,7 @@ impl RustGate {
         let (dispatches, actions_refused) = match self.action_authorizer.authorize(&decision, Some(&evidence), &self.trust) {
             Ok(reqs) => (self.enforcement.dispatch(reqs), None),
             Err(e) => {
-                self.audit.append(
+                self.audit(
                     at,
                     &request.correlation_id,
                     None,
@@ -385,9 +514,14 @@ impl RustGate {
                 ),
             };
             if !d.deduplicated {
-                self.events.append(at, &request.correlation_id, Some(sealed), event)?;
+                if let Ok(receipt) = &d.result {
+                    // Persist the receipt so a restarted instance never
+                    // re-executes this action.
+                    self.commit(JournalRecord::ActionCompleted { idempotency_key: d.request.idempotency_key, receipt: receipt.clone() })?;
+                }
+                self.event(at, &request.correlation_id, Some(sealed), event)?;
             }
-            self.audit.append(
+            self.audit(
                 at,
                 &request.correlation_id,
                 None,
@@ -419,12 +553,14 @@ impl RustGate {
         let report = ReplayEngine {
             decisions: &self.decisions,
             facts: &self.facts,
+            normalizer: &self.normalizer,
+            observations: &self.observations,
             policies: &self.policies,
             evidence: &self.evidence,
             trust: &self.trust,
         }
         .replay(decision_hash)?;
-        self.audit.append(
+        self.audit(
             at,
             &correlation,
             None,
@@ -450,21 +586,31 @@ impl RustGate {
             .values()
             .map(|h| self.facts.get(h).cloned().ok_or_else(|| GovError::FactNotFound(h.short())))
             .collect::<Result<_>>()?;
-        let mut observations: Vec<ObservationEnvelope> = Vec::new();
+        let mut observations: BTreeMap<Digest, ObservationEnvelope> = BTreeMap::new();
+        let mut mappings: BTreeMap<Digest, MappingRule> = BTreeMap::new();
         for f in &facts {
             let o = self
                 .observations
                 .get(&f.body.observation_hash)
                 .ok_or_else(|| GovError::ObservationNotFound(f.body.observation_hash.short()))?;
-            if !observations.iter().any(|x| x.content_hash == o.hash()) {
-                observations.push(o.envelope.clone());
-            }
+            observations.insert(o.hash(), o.envelope.clone());
+            let m = self
+                .normalizer
+                .mapping(&f.body.mapping_hash)
+                .ok_or_else(|| GovError::Integrity(format!("mapping {} not found", f.body.mapping_hash.short())))?;
+            mappings.insert(f.body.mapping_hash, m.clone());
         }
-        observations.sort_by_key(|o| o.content_hash);
-        Ok(EvidenceBundle { evidence, decision, policy, facts, observations })
+        Ok(EvidenceBundle {
+            evidence,
+            decision,
+            policy,
+            facts,
+            observations: observations.into_values().collect(),
+            mappings: mappings.into_values().collect(),
+        })
     }
 
-    /// Recompute every hash and chain in every store.
+    /// Recompute every hash, chain and signature in every in-memory store.
     pub fn verify_integrity(&self) -> Result<IntegrityReport> {
         self.observations.verify_integrity()?;
         self.facts.verify_integrity()?;
@@ -483,6 +629,26 @@ impl RustGate {
             audit_head: self.audit.head(),
             event_head: self.events.head(),
             evidence_head: self.evidence.head().1,
+            journal_entries: self.journal_head.0,
+            journal_head: self.journal_head.1,
         })
+    }
+
+    /// Re-read the durable journal and check its chain ends exactly where
+    /// this instance believes it does (detects out-of-band edits, deletions
+    /// and appends by another writer).
+    pub fn verify_journal(&mut self) -> Result<(u64, Digest)> {
+        let entries = self.journal.load()?;
+        let head = storage::verify_chain(&entries)?;
+        if head != self.journal_head {
+            return Err(GovError::Storage(format!(
+                "journal head {}#{} differs from in-memory head {}#{}",
+                head.1.short(),
+                head.0,
+                self.journal_head.1.short(),
+                self.journal_head.0
+            )));
+        }
+        Ok(head)
     }
 }

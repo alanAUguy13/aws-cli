@@ -62,6 +62,8 @@ pub enum GovError {
     Integrity(String),
     #[error("engine program invalid: {0}")]
     InvalidProgram(String),
+    #[error("storage: {0}")]
+    Storage(String),
 }
 
 pub type Result<T> = std::result::Result<T, GovError>;

@@ -31,6 +31,8 @@ pub mod domain {
     pub const IDEMPOTENCY: &str = "rustgate.enforcement.idempotency.v1";
     pub const REPLAY_REPORT: &str = "rustgate.replay.report.v1";
     pub const POLICY_APPROVAL: &str = "rustgate.policy.approval.v1";
+    pub const MAPPING: &str = "rustgate.fact.mapping.v1";
+    pub const JOURNAL_ENTRY: &str = "rustgate.journal.entry.v1";
 }
 
 /// A SHA-256 digest. Serialises as lowercase hex.

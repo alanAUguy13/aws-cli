@@ -154,6 +154,12 @@ impl EnforcementService {
         self.connectors.insert(name.into(), connector);
     }
 
+    /// Record a completed dispatch (journal recovery) so a restarted
+    /// instance never re-executes an action that already succeeded.
+    pub fn restore_receipt(&mut self, idempotency_key: Digest, receipt: Receipt) {
+        self.completed.entry(idempotency_key).or_insert(receipt);
+    }
+
     pub fn dispatch(&mut self, requests: Vec<DispatchRequest>) -> Vec<DispatchOutcome> {
         requests
             .into_iter()

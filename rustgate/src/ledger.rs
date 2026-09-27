@@ -55,14 +55,42 @@ impl<T: Serialize + Clone> Ledger<T> {
     }
 
     pub fn append(&mut self, at: u64, correlation_id: &str, causation: Option<Digest>, event: T) -> Result<Digest> {
+        let entry = self.prepare(at, correlation_id, causation, event)?;
+        self.push(entry)
+    }
+
+    /// Build the next entry without appending it (write-ahead: journal
+    /// first, then [`Ledger::push`]).
+    pub fn prepare(&self, at: u64, correlation_id: &str, causation: Option<Digest>, event: T) -> Result<LedgerEntry<T>> {
         let seq = self.entries.len() as u64;
         let prev_hash = self.head();
         let entry_hash = hash_canonical(
             domain::LEDGER_ENTRY,
             &EntryPreimage { seq, at, correlation_id, causation: &causation, event: &event, prev_hash: &prev_hash },
         )?;
-        self.entries.push(LedgerEntry { seq, at, correlation_id: correlation_id.to_string(), causation, event, prev_hash, entry_hash });
-        Ok(entry_hash)
+        Ok(LedgerEntry { seq, at, correlation_id: correlation_id.to_string(), causation, event, prev_hash, entry_hash })
+    }
+
+    /// Append an entry built by [`Ledger::prepare`] (or loaded from a
+    /// journal), checking that it extends the chain.
+    pub fn push(&mut self, e: LedgerEntry<T>) -> Result<Digest> {
+        let computed = hash_canonical(
+            domain::LEDGER_ENTRY,
+            &EntryPreimage {
+                seq: e.seq,
+                at: e.at,
+                correlation_id: &e.correlation_id,
+                causation: &e.causation,
+                event: &e.event,
+                prev_hash: &e.prev_hash,
+            },
+        )?;
+        if e.seq != self.entries.len() as u64 || e.prev_hash != self.head() || computed != e.entry_hash {
+            return Err(GovError::Integrity(format!("ledger entry #{} does not extend the chain", e.seq)));
+        }
+        let h = e.entry_hash;
+        self.entries.push(e);
+        Ok(h)
     }
 
     pub fn verify(&self) -> Result<()> {

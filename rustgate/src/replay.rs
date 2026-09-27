@@ -17,8 +17,9 @@ use crate::decision::{DecisionBody, DecisionService};
 use crate::engine::{self, ENGINE_VERSION};
 use crate::error::Result;
 use crate::evidence::EvidenceRepository;
-use crate::fact::{FactSnapshot, FactStore};
+use crate::fact::{FactNormalizer, FactSnapshot, FactStore};
 use crate::keys::TrustStore;
+use crate::observation::ObservationStore;
 use crate::policy::{CompiledPolicyStore, Effect};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +64,8 @@ pub struct ReplayReport {
 pub struct ReplayEngine<'a> {
     pub decisions: &'a DecisionService,
     pub facts: &'a FactStore,
+    pub normalizer: &'a FactNormalizer,
+    pub observations: &'a ObservationStore,
     pub policies: &'a CompiledPolicyStore,
     pub evidence: &'a EvidenceRepository,
     pub trust: &'a TrustStore,
@@ -130,6 +133,16 @@ impl ReplayEngine<'_> {
         for (name, h) in &d.fact_hashes {
             match self.facts.get(h) {
                 Some(f) if f.verify().is_ok() => {
+                    // Re-run normalisation: the fact must be exactly what its
+                    // mapping rule derives from its signed observation.
+                    let derived = self
+                        .observations
+                        .get(&f.body.observation_hash)
+                        .ok_or_else(|| format!("observation {} missing", f.body.observation_hash.short()))
+                        .and_then(|o| self.normalizer.rederive(f, &o.envelope).map_err(|e| e.to_string()));
+                    if let Err(reason) = derived {
+                        return (ReplayVerdict::Unverifiable { reason }, None);
+                    }
                     facts.insert(name.clone(), f.clone());
                 }
                 Some(_) => return (ReplayVerdict::Unverifiable { reason: format!("fact {} fails integrity check", h.short()) }, None),

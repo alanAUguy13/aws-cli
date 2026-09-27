@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use crate::canonical::{domain, hash_canonical, Digest};
 use crate::error::{GovError, Result};
-use crate::observation::StoredObservation;
+use crate::observation::{ObservationEnvelope, StoredObservation};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
@@ -64,6 +64,8 @@ pub struct FactBody {
     pub confidence_bp: u32,
     pub observation_hash: Digest,
     pub mapping_id: String,
+    /// Content hash of the exact mapping rule version that derived this fact.
+    pub mapping_hash: Digest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,49 +155,120 @@ pub struct NormalizationOutcome {
 /// mapping rules and handed to the policy compiler for semantic validation.
 pub type FactCatalog = BTreeMap<String, FactType>;
 
+/// Canonical mapping registry.
+///
+/// Every version of every mapping rule ever registered is kept, addressed by
+/// its content hash, and each fact records the hash of the exact rule that
+/// derived it. That makes normalisation itself re-executable: replay and
+/// offline bundle verification re-derive each fact from its signed
+/// observation and require a bit-identical result.
 #[derive(Debug, Default)]
 pub struct FactNormalizer {
-    rules: BTreeMap<String, Vec<MappingRule>>,
+    /// schema -> active rules, sorted by id.
+    active: BTreeMap<String, Vec<(Digest, MappingRule)>>,
+    history: BTreeMap<Digest, MappingRule>,
+}
+
+impl MappingRule {
+    pub fn hash(&self) -> Result<Digest> {
+        hash_canonical(domain::MAPPING, self)
+    }
 }
 
 impl FactNormalizer {
-    pub fn register(&mut self, rule: MappingRule) -> Result<()> {
-        if let Some(existing) = self.catalog().get(&rule.fact_name) {
-            if *existing != rule.fact_type() {
-                return Err(GovError::Compilation(vec![format!(
-                    "fact '{}' already registered as {existing:?}, mapping '{}' produces {:?}",
-                    rule.fact_name,
-                    rule.id,
-                    rule.fact_type()
-                )]));
-            }
+    /// Validate a rule against the current vocabulary without registering it.
+    pub fn check(&self, rule: &MappingRule) -> Result<Digest> {
+        let clash = self
+            .active
+            .values()
+            .flatten()
+            .find(|(_, r)| r.fact_name == rule.fact_name && r.id != rule.id && r.fact_type() != rule.fact_type());
+        if let Some((_, existing)) = clash {
+            return Err(GovError::Compilation(vec![format!(
+                "fact '{}' already produced as {:?} by mapping '{}', mapping '{}' produces {:?}",
+                rule.fact_name,
+                existing.fact_type(),
+                existing.id,
+                rule.id,
+                rule.fact_type()
+            )]));
         }
-        let list = self.rules.entry(rule.schema.clone()).or_default();
-        list.retain(|r| r.id != rule.id);
-        list.push(rule);
-        list.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(())
+        rule.hash()
+    }
+
+    /// True if `rule` is already the active version of its id.
+    pub fn is_active(&self, rule: &MappingRule) -> Result<bool> {
+        let h = rule.hash()?;
+        Ok(self.active.get(&rule.schema).is_some_and(|list| list.iter().any(|(ah, _)| *ah == h)))
+    }
+
+    /// Register (or supersede, by id) a rule. Superseded versions stay in
+    /// the history so facts they derived remain re-derivable.
+    pub fn register(&mut self, rule: MappingRule) -> Result<Digest> {
+        let h = self.check(&rule)?;
+        for list in self.active.values_mut() {
+            list.retain(|(_, r)| r.id != rule.id);
+        }
+        let list = self.active.entry(rule.schema.clone()).or_default();
+        list.push((h, rule.clone()));
+        list.sort_by(|a, b| a.1.id.cmp(&b.1.id));
+        self.history.insert(h, rule);
+        Ok(h)
+    }
+
+    pub fn mapping(&self, hash: &Digest) -> Option<&MappingRule> {
+        self.history.get(hash)
     }
 
     pub fn catalog(&self) -> FactCatalog {
-        self.rules.values().flatten().map(|r| (r.fact_name.clone(), r.fact_type())).collect()
+        self.active.values().flatten().map(|(_, r)| (r.fact_name.clone(), r.fact_type())).collect()
     }
 
     pub fn normalize(&self, obs: &StoredObservation) -> NormalizationOutcome {
         let mut out = NormalizationOutcome::default();
-        let body = &obs.envelope.body;
-        for rule in self.rules.get(&body.schema).into_iter().flatten() {
-            match apply_rule(rule, obs) {
+        for (h, rule) in self.active.get(&obs.envelope.body.schema).into_iter().flatten() {
+            match derive_fact(rule, *h, &obs.envelope) {
                 Ok(fact) => out.facts.push(fact),
                 Err(reason) => out.rejections.push(QualityViolation { mapping_id: rule.id.clone(), observation_hash: obs.hash(), reason }),
             }
         }
         out
     }
+
+    /// Re-derive `fact` from `envelope` with the rule it names and require
+    /// a bit-identical result.
+    pub fn rederive(&self, fact: &Fact, envelope: &ObservationEnvelope) -> Result<()> {
+        let rule = self.mapping(&fact.body.mapping_hash).ok_or_else(|| {
+            GovError::Integrity(format!("fact {} names unknown mapping {}", fact.fact_hash.short(), fact.body.mapping_hash.short()))
+        })?;
+        verify_derivation(rule, fact, envelope)
+    }
 }
 
-fn apply_rule(rule: &MappingRule, obs: &StoredObservation) -> std::result::Result<Fact, String> {
-    let body = &obs.envelope.body;
+/// Check that `rule` applied to `envelope` produces exactly `fact`.
+pub fn verify_derivation(rule: &MappingRule, fact: &Fact, envelope: &ObservationEnvelope) -> Result<()> {
+    let h = rule.hash()?;
+    if h != fact.body.mapping_hash {
+        return Err(GovError::Integrity(format!("fact {} was not derived by mapping {}", fact.fact_hash.short(), h.short())));
+    }
+    match derive_fact(rule, h, envelope) {
+        Ok(derived) if derived == *fact => Ok(()),
+        Ok(_) => Err(GovError::Integrity(format!(
+            "fact {} does not match re-derivation from observation {} by mapping '{}'",
+            fact.fact_hash.short(),
+            envelope.content_hash.short(),
+            rule.id
+        ))),
+        Err(reason) => Err(GovError::Integrity(format!("fact {} cannot be re-derived: {reason}", fact.fact_hash.short()))),
+    }
+}
+
+/// Apply one mapping rule to one observation. Pure and deterministic.
+pub fn derive_fact(rule: &MappingRule, mapping_hash: Digest, envelope: &ObservationEnvelope) -> std::result::Result<Fact, String> {
+    let body = &envelope.body;
+    if rule.schema != body.schema {
+        return Err(format!("mapping '{}' is for schema '{}', observation is '{}'", rule.id, rule.schema, body.schema));
+    }
     let payload = &body.payload;
     let subject = payload
         .get(&rule.subject_field)
@@ -245,8 +318,9 @@ fn apply_rule(rule: &MappingRule, obs: &StoredObservation) -> std::result::Resul
         value,
         observed_at: body.observed_at,
         confidence_bp,
-        observation_hash: obs.hash(),
+        observation_hash: envelope.content_hash,
         mapping_id: rule.id.clone(),
+        mapping_hash,
     })
     .map_err(|e| e.to_string())
 }
@@ -336,6 +410,16 @@ impl FactStore {
 
     pub fn get(&self, hash: &Digest) -> Option<&Fact> {
         self.by_hash.get(hash)
+    }
+
+    pub fn contains(&self, hash: &Digest) -> bool {
+        self.by_hash.contains_key(hash)
+    }
+
+    /// Verified insert, for the journal path.
+    pub fn restore(&mut self, fact: Fact) -> Result<bool> {
+        fact.verify()?;
+        Ok(self.insert(fact))
     }
 
     pub fn len(&self) -> usize {

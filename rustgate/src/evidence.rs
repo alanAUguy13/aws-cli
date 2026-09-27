@@ -9,7 +9,9 @@
 //! Evidence records are additionally chained to each other (`prev_evidence_hash`)
 //! so deleting or reordering a record is as detectable as editing one.
 //! [`EvidenceBundle`] packages everything needed to verify a decision offline,
-//! with no access to RustGate's stores.
+//! with no access to RustGate's stores, including the mapping rules, so
+//! the verifier re-derives every fact from its signed observation rather
+//! than trusting the fact records.
 
 use std::collections::BTreeMap;
 
@@ -19,7 +21,7 @@ use crate::canonical::{domain, hash_canonical, Digest};
 use crate::decision::{DecisionBody, DecisionRecord};
 use crate::engine::{self, ENGINE_VERSION};
 use crate::error::{GovError, Result};
-use crate::fact::{Fact, FactSnapshot};
+use crate::fact::{verify_derivation, Fact, FactSnapshot, MappingRule};
 use crate::keys::{EvidenceSigner, KeyPurpose, SignatureEnvelope, TrustStore};
 use crate::observation::{ObservationEnvelope, SourceRef};
 use crate::policy::CompiledPolicy;
@@ -32,6 +34,7 @@ pub struct ProvenanceLink {
     pub source: SourceRef,
     pub schema: String,
     pub mapping_id: String,
+    pub mapping_hash: Digest,
     pub observed_at: u64,
 }
 
@@ -93,6 +96,7 @@ impl EvidenceGenerator {
                 source: obs.body.source.clone(),
                 schema: obs.body.schema.clone(),
                 mapping_id: f.body.mapping_id.clone(),
+                mapping_hash: f.body.mapping_hash,
                 observed_at: f.body.observed_at,
             });
         }
@@ -133,6 +137,9 @@ impl EvidenceRepository {
         let (seq, prev) = self.head();
         if record.body.seq != seq || record.body.prev_evidence_hash != prev {
             return Err(GovError::Integrity("evidence record does not extend the chain head".into()));
+        }
+        if hash_canonical(domain::EVIDENCE, &record.body)? != record.evidence_hash {
+            return Err(GovError::Integrity(format!("evidence #{} content does not match its hash", record.body.seq)));
         }
         self.by_decision.entry(record.body.decision_hash).or_insert(self.records.len());
         self.records.push(record);
@@ -177,6 +184,8 @@ pub struct EvidenceBundle {
     pub policy: CompiledPolicy,
     pub facts: Vec<Fact>,
     pub observations: Vec<ObservationEnvelope>,
+    /// The exact mapping rule versions that derived `facts`.
+    pub mappings: Vec<MappingRule>,
 }
 
 impl EvidenceBundle {
@@ -199,15 +208,18 @@ impl EvidenceBundle {
                 o.body.observed_at,
             )?;
         }
-        // 2. Fact hashes, each linked to a bundled observation.
+        // 2. Facts: re-run normalisation. Each fact must be exactly what its
+        //    named mapping rule produces from its signed observation.
+        let mappings: BTreeMap<Digest, &MappingRule> = self.mappings.iter().map(|m| m.hash().map(|h| (h, m))).collect::<Result<_>>()?;
         for f in &self.facts {
             f.verify()?;
             let o = obs_by_hash
                 .get(&f.body.observation_hash)
                 .ok_or_else(|| GovError::Integrity(format!("fact {} references missing observation", f.fact_hash.short())))?;
-            if o.body.tenant != f.body.tenant || o.body.observed_at != f.body.observed_at {
-                return Err(GovError::Integrity(format!("fact {} inconsistent with its observation", f.fact_hash.short())));
-            }
+            let rule = mappings
+                .get(&f.body.mapping_hash)
+                .ok_or_else(|| GovError::Integrity(format!("fact {} references a mapping not in the bundle", f.fact_hash.short())))?;
+            verify_derivation(rule, f, o)?;
         }
         // 3. Policy hash.
         self.policy.verify()?;

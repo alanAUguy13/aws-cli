@@ -95,7 +95,6 @@ pub struct DecisionService {
 }
 
 impl DecisionService {
-    /// Returns `(record, is_new)`.
     pub fn record(
         &mut self,
         body: DecisionBody,
@@ -103,6 +102,16 @@ impl DecisionService {
         requested_by: &str,
         decided_at: u64,
     ) -> Result<(DecisionRecord, bool)> {
+        let (rec, is_new) = self.prepare(body, correlation_id, requested_by, decided_at)?;
+        if is_new {
+            self.restore(rec.clone())?;
+        }
+        Ok((rec, is_new))
+    }
+
+    /// Build the record without storing it; returns the existing record if
+    /// this decision was already made.
+    pub fn prepare(&self, body: DecisionBody, correlation_id: &str, requested_by: &str, decided_at: u64) -> Result<(DecisionRecord, bool)> {
         let decision_hash = body.hash()?;
         if let Some(existing) = self.records.get(&decision_hash) {
             return Ok((existing.clone(), false));
@@ -114,8 +123,17 @@ impl DecisionService {
             requested_by: requested_by.to_string(),
             decided_at,
         };
-        self.records.insert(decision_hash, rec.clone());
         Ok((rec, true))
+    }
+
+    /// Store a record (live path or journal recovery), verifying its hash.
+    pub fn restore(&mut self, rec: DecisionRecord) -> Result<()> {
+        rec.verify()?;
+        if self.records.contains_key(&rec.decision_hash) {
+            return Err(GovError::Integrity(format!("decision {} already recorded", rec.decision_hash.short())));
+        }
+        self.records.insert(rec.decision_hash, rec);
+        Ok(())
     }
 
     pub fn get(&self, hash: &Digest) -> Result<&DecisionRecord> {
@@ -128,6 +146,10 @@ impl DecisionService {
 
     pub fn len(&self) -> usize {
         self.records.len()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &DecisionRecord> {
+        self.records.values()
     }
 
     pub fn is_empty(&self) -> bool {
