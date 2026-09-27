@@ -16,8 +16,9 @@ env:
 
 jobs:
   aws-sdk-pr-build:
-    # Skip draft PRs and PRs from forked repos (they don't have access)
-    if: github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
+    # Skip draft PRs, PRs from forked repos, and runs in forks of aws/aws-cli:
+    # the IAM role only trusts aws/aws-cli, so none of those can assume it.
+    if: github.repository == 'aws/aws-cli' && github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
       id-token: write
