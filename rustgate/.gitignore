@@ -1,0 +1,3 @@
+/target
+# The repository root .gitignore ignores every src/ directory; RustGate needs its own.
+!/src/
